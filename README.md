@@ -45,4 +45,3 @@ const EXCLUDED_DOMAINS = [
 3. 使いたい `.user.js` の内容を貼り付けます。
 4. 保存して対象サイトを開きます。
 
-
