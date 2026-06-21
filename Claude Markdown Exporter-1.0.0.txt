@@ -1,0 +1,438 @@
+// ==UserScript==
+// @name         Claude Markdown Exporter
+// @namespace    https://claude.ai/
+// @version      1.0.0
+// @description  claude.ai の会話を Markdown ファイルとしてエクスポートするボタンを追加します
+// @author       seijiro
+// @match        https://claude.ai/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ─── 定数 ────────────────────────────────────────────────────────────────────
+
+  const BUTTON_ID = 'claude-md-export-btn';
+  const STYLE_ID  = 'claude-md-export-style';
+
+  // ─── スタイル注入 ─────────────────────────────────────────────────────────────
+
+  function injectStyle() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = `
+      #${BUTTON_ID} {
+        position: fixed;
+        top: 10px;
+        right: 80px;
+        z-index: 9999;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 14px;
+        background: #d97706;
+        color: #fff;
+        border: none;
+        border-radius: 8px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+        transition: background 0.15s, opacity 0.15s;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      #${BUTTON_ID}:hover { background: #b45309; }
+      #${BUTTON_ID}:active { background: #92400e; }
+      #${BUTTON_ID}:disabled { opacity: 0.6; cursor: not-allowed; }
+      #${BUTTON_ID} .icon { font-size: 15px; line-height: 1; }
+      #claude-md-toast {
+        position: fixed;
+        bottom: 140px;
+        right: 20px;
+        z-index: 10000;
+        padding: 8px 16px;
+        border-radius: 8px;
+        font-size: 13px;
+        font-weight: 500;
+        color: #fff;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        animation: claudeMdFadeIn 0.2s ease;
+      }
+      #claude-md-toast.success { background: #059669; }
+      #claude-md-toast.error   { background: #dc2626; }
+      @keyframes claudeMdFadeIn {
+        from { opacity: 0; transform: translateY(6px); }
+        to   { opacity: 1; transform: translateY(0); }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  // ─── 認証情報の取得 ──────────────────────────────────────────────────────────
+
+  function getOrganizationId() {
+    const m = document.cookie.match(/lastActiveOrg=([^;]+)/);
+    return m ? m[1] : null;
+  }
+
+  function extractConversationId() {
+    const m = window.location.href.match(/\/chat\/([a-f0-9-]+)/);
+    return m ? m[1] : null;
+  }
+
+  // ─── Claude API からデータ取得 ───────────────────────────────────────────────
+
+  async function fetchClaudeData(orgId, convId) {
+    const url = `https://claude.ai/api/organizations/${orgId}/chat_conversations/${convId}?tree=True&rendering_mode=messages&render_all_tools=true`;
+    const res = await fetch(url, {
+      method: 'GET',
+      credentials: 'include',
+      headers: { Accept: '*/*', 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) throw new Error(`API エラー: ${res.status} ${res.statusText}`);
+    return res.json();
+  }
+
+  // ─── MIME タイプ → 言語名変換 ────────────────────────────────────────────────
+
+  function mimeToLang(mime) {
+    const map = {
+      'application/vnd.ant.react': 'jsx',
+      'application/vnd.ant.jsx': 'jsx',
+      'text/jsx': 'jsx',
+      'application/javascript': 'javascript',
+      'text/javascript': 'javascript',
+      'application/typescript': 'typescript',
+      'text/typescript': 'typescript',
+      'text/x-python': 'python',
+      'application/x-python-code': 'python',
+      'application/json': 'json',
+      'text/json': 'json',
+      'image/svg+xml': 'svg',
+      'application/xml': 'xml',
+      'text/xml': 'xml',
+      'text/html': 'html',
+      'text/css': 'css',
+      'text/markdown': 'markdown',
+      'text/x-sh': 'bash',
+      'application/x-sh': 'bash',
+      'application/sql': 'sql',
+      'text/x-go': 'go',
+      'text/x-rust': 'rust',
+      'text/x-java': 'java',
+      'text/x-c': 'c',
+      'text/x-c++': 'cpp',
+      'text/yaml': 'yaml',
+      'application/x-yaml': 'yaml',
+    };
+    if (map[mime]) return map[mime];
+    if (mime.includes('javascript')) return 'javascript';
+    if (mime.includes('typescript')) return 'typescript';
+    if (mime.includes('python')) return 'python';
+    if (mime.includes('json')) return 'json';
+    if (mime.includes('xml')) return 'xml';
+    if (mime.includes('html')) return 'html';
+    if (mime.includes('css')) return 'css';
+    if (mime.includes('markdown')) return 'markdown';
+    if (mime.includes('react') || mime.includes('jsx')) return 'jsx';
+    return 'text';
+  }
+
+  // ─── content[] アイテムを Markdown 文字列に変換 ──────────────────────────────
+
+  function processContentItems(items, skipThinking = false) {
+    const parts = [];
+    for (const item of items) {
+      if (item.type === 'text') {
+        const txt = item.text?.trim();
+        if (txt) parts.push(txt);
+      } else if (!skipThinking && item.type === 'thinking') {
+        const t = item.thinking?.trim();
+        if (t) parts.push(`**思考過程:**\n${t}`);
+      } else if (item.type === 'tool_use' && item.name === 'artifacts') {
+        if (item.input?.content) {
+          const lang = mimeToLang(item.input.language || item.input.type || 'text/plain');
+          const title = item.input.title ? `\n**${item.input.title}**\n` : '';
+          parts.push(`${title}\`\`\`${lang}\n${item.input.content}\n\`\`\``);
+        }
+      }
+    }
+    return parts.join('\n\n');
+  }
+
+  // ─── API レスポンスをメッセージ配列に変換 ────────────────────────────────────
+
+  function convertResponseToMessages(data, convId) {
+    const messages = [];
+    const rawMsgs = [...(data.chat_messages || [])].sort((a, b) => a.index - b.index);
+    const idToIndex = new Map();
+
+    for (const msg of rawMsgs) {
+      if (msg.truncated) continue;
+
+      const role = msg.sender === 'human' ? 'user' : 'assistant';
+      const contents = [];
+
+      // ユーザー: 添付画像
+      if (role === 'user' && msg.files?.length > 0) {
+        for (const f of msg.files) {
+          if (f.file_kind === 'image') {
+            const imgUrl = f.preview_url || f.thumbnail_url
+              || f.preview_asset?.url || f.thumbnail_asset?.url;
+            if (imgUrl) contents.push({ type: 'image', imageUrl: `https://claude.ai${imgUrl}` });
+          }
+        }
+      }
+
+      // ユーザー: テキスト添付
+      if (role === 'user' && msg.attachments?.length > 0) {
+        for (const att of msg.attachments) {
+          if (att.file_type === 'txt') {
+            contents.push({ type: 'text', content: `${att.extracted_content || ''}\n` });
+          } else {
+            contents.push({ type: 'text', content: `[${att.file_type}] ${att.file_name}\n` });
+          }
+        }
+      }
+
+      // Thinking ブロック
+      const items = msg.content || [];
+      for (const item of items) {
+        if (item.type === 'thinking') {
+          const t = (item.thinking ?? '').trim();
+          if (t) contents.push({ type: 'thinking', content: t });
+        }
+      }
+
+      // メインコンテンツ (thinking は processContentItems 内でスキップ)
+      const mainText = processContentItems(items, true);
+      if (mainText.trim()) contents.push({ type: 'markdown', content: mainText });
+
+      if (contents.length === 0) continue;
+
+      const entry = {
+        id: `claude_${msg.uuid}`,
+        chatGroupId: convId,
+        role,
+        model: 'claude',
+        displayModel: 'Claude',
+        contents,
+        created_at: msg.created_at,
+        updated_at: msg.updated_at,
+      };
+
+      // ブランチ: parent_message_uuid が既存インデックスにあれば上書き
+      const parentId = msg.parent_message_uuid;
+      if (idToIndex.has(parentId)) {
+        messages[idToIndex.get(parentId)] = entry;
+      } else {
+        messages.push(entry);
+        idToIndex.set(msg.uuid, messages.length - 1);
+      }
+    }
+    return messages;
+  }
+
+  // ─── メッセージ配列 → Markdown 文字列 ───────────────────────────────────────
+
+  function formatTimestamp(ts) {
+    if (ts == null) return null;
+    try {
+      const d = new Date(ts);
+      if (isNaN(d.getTime())) return null;
+      const pad = n => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} `
+           + `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    } catch { return null; }
+  }
+
+  function messagesToMarkdown(messages, opts = {}) {
+    const { enableThinking = false, sourceUrl = null, showTimestamp = true } = opts;
+    if (messages.length === 0) return '';
+
+    const blocks = [];
+
+    if (sourceUrl) blocks.push(`> From: ${sourceUrl}`);
+
+    messages.forEach((msg, idx) => {
+      const header = msg.role === 'user'
+        ? '# you asked'
+        : `# ${msg.model} response`;
+
+      const parts = [header];
+
+      // タイムスタンプ (user のみ)
+      if (showTimestamp && msg.role === 'user') {
+        const ts = formatTimestamp(msg.created_at);
+        if (ts) parts.push(`message time: ${ts}`);
+      }
+
+      // コンテンツ
+      const contentLines = msg.contents
+        .filter(c => {
+          if (c.type === 'thinking' && !enableThinking) return false;
+          return (c.type === 'markdown' || c.type === 'text' || c.type === 'thinking') && c.content;
+        })
+        .map(c => {
+          const text = c.content.trim();
+          if (c.type === 'thinking') return `Thinking\n\n${text}`;
+          return text;
+        })
+        .filter(Boolean);
+
+      if (contentLines.length > 0) {
+        parts.push(...contentLines);
+      } else {
+        parts.push('*(No content)*');
+      }
+
+      blocks.push(parts.join('\n\n'));
+      if (idx < messages.length - 1) blocks.push('---');
+    });
+
+    return blocks.join('\n\n');
+  }
+
+  // ─── ファイルダウンロード ─────────────────────────────────────────────────────
+
+  function downloadMarkdown(content, filename) {
+    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function sanitizeFilename(name) {
+    return (name || 'claude-conversation')
+      .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+      .trim()
+      .slice(0, 100);
+  }
+
+  // ─── トースト通知 ─────────────────────────────────────────────────────────────
+
+  function showToast(message, type = 'success') {
+    const existing = document.getElementById('claude-md-toast');
+    if (existing) existing.remove();
+
+    const toast = document.createElement('div');
+    toast.id = 'claude-md-toast';
+    toast.className = type;
+    toast.textContent = message;
+    document.body.appendChild(toast);
+
+    setTimeout(() => toast.remove(), 3000);
+  }
+
+  // ─── エクスポート本体 ─────────────────────────────────────────────────────────
+
+  async function exportMarkdown() {
+    const btn = document.getElementById(BUTTON_ID);
+
+    const convId = extractConversationId();
+    if (!convId) {
+      showToast('会話ページで実行してください', 'error');
+      return;
+    }
+
+    const orgId = getOrganizationId();
+    if (!orgId) {
+      showToast('ログイン状態を確認してください', 'error');
+      return;
+    }
+
+    btn.disabled = true;
+    btn.querySelector('.label').textContent = '取得中...';
+
+    try {
+      const data = await fetchClaudeData(orgId, convId);
+      const messages = convertResponseToMessages(data, convId);
+
+      if (messages.length === 0) {
+        showToast('エクスポートするメッセージがありません', 'error');
+        return;
+      }
+
+      const markdown = messagesToMarkdown(messages, {
+        enableThinking: false,
+        sourceUrl: window.location.href,
+        showTimestamp: true,
+      });
+
+      const title = sanitizeFilename(data.name || 'claude-conversation');
+      downloadMarkdown(markdown, `${title}.md`);
+      showToast('Markdown をエクスポートしました', 'success');
+    } catch (err) {
+      console.error('[Claude MD Exporter]', err);
+      showToast(`エクスポート失敗: ${err.message}`, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.querySelector('.label').textContent = 'MD Export';
+    }
+  }
+
+  // ─── ボタンの設置 ─────────────────────────────────────────────────────────────
+
+  function insertButton() {
+    if (document.getElementById(BUTTON_ID)) return;
+
+    // チャットページでなければ表示しない
+    if (!extractConversationId()) return;
+
+    const btn = document.createElement('button');
+    btn.id = BUTTON_ID;
+    btn.innerHTML = '<span class="icon">⬇</span><span class="label">MD Export</span>';
+    btn.addEventListener('click', exportMarkdown);
+    document.body.appendChild(btn);
+  }
+
+  function removeButton() {
+    document.getElementById(BUTTON_ID)?.remove();
+  }
+
+  // ─── URL 変化の監視 ──────────────────────────────────────────────────────────
+
+  let lastPathname = location.pathname;
+
+  function onNavigate() {
+    if (location.pathname === lastPathname) return;
+    lastPathname = location.pathname;
+
+    removeButton();
+
+    // SPA 遷移後、DOM が安定するのを少し待つ
+    setTimeout(insertButton, 600);
+  }
+
+  // History API を Monkey-patch して pushState / replaceState も検知する
+  ['pushState', 'replaceState'].forEach(method => {
+    const original = history[method];
+    history[method] = function (...args) {
+      const ret = original.apply(this, args);
+      onNavigate();
+      return ret;
+    };
+  });
+  window.addEventListener('popstate', onNavigate);
+
+  // ─── 初期化 ───────────────────────────────────────────────────────────────────
+
+  injectStyle();
+
+  // DOM が完全に読み込まれてからボタンを挿入
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => setTimeout(insertButton, 800));
+  } else {
+    setTimeout(insertButton, 800);
+  }
+
+})();
