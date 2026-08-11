@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         YouTube Dual Subtitles
 // @namespace    https://github.com/local/my-tampermonkey-scripts
-// @version      0.1.1
+// @version      0.2.0
 // @description  Show an original YouTube caption track and its auto-translation at the same time.
 // @match        https://www.youtube.com/watch*
 // @match        https://www.youtube.com/embed/*
 // @run-at       document-idle
+// @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
 // @connect      youtube.com
 // @connect      www.youtube.com
@@ -21,6 +22,21 @@
     preferManualCaptions: true,
     bottomOffsetPercent: 13,
     pollMs: 120,
+    playerReadyTimeoutMs: 6000,
+    proofTokenTimeoutMs: 3500,
+  };
+
+  // Current yt-dlp Android client values (2026-07/08). This is only a fallback;
+  // the live WEB player path is always tried first.
+  const ANDROID_CLIENT = {
+    clientName: "ANDROID",
+    clientVersion: "21.26.364",
+    androidSdkVersion: 30,
+    osName: "Android",
+    osVersion: "11",
+    userAgent: "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip",
+    hl: "en",
+    gl: "US",
   };
 
   const ROOT_ID = "yt-dualsub-root";
@@ -37,7 +53,11 @@
     lastOriginalText: "",
     lastTranslatedText: "",
     reloadTimer: 0,
+    loadSerial: 0,
   };
+
+  const PAGE = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+  const sleep = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
   function addStyle() {
     if (document.getElementById(STYLE_ID)) return;
@@ -134,7 +154,7 @@
 
   function ensureRoot() {
     addStyle();
-    let player = document.querySelector(".html5-video-player") || document.querySelector("#movie_player");
+    const player = document.querySelector(".html5-video-player") || document.querySelector("#movie_player");
     if (!player) return null;
 
     let root = document.getElementById(ROOT_ID);
@@ -153,7 +173,7 @@
 
   function ensureToggleButton() {
     addStyle();
-    let player = document.querySelector(".html5-video-player") || document.querySelector("#movie_player");
+    const player = document.querySelector(".html5-video-player") || document.querySelector("#movie_player");
     if (!player) return null;
 
     let button = document.getElementById(BUTTON_ID);
@@ -184,7 +204,10 @@
       STATE.videoId = "";
       loadForCurrentVideo();
     } else {
+      STATE.loadSerial += 1;
       STATE.status = "";
+      STATE.original = [];
+      STATE.translated = [];
       STATE.lastOriginalText = "";
       STATE.lastTranslatedText = "";
       render();
@@ -198,19 +221,101 @@
     return "";
   }
 
+  function getMoviePlayer() {
+    try {
+      const doc = PAGE.document || document;
+      return doc.getElementById("movie_player") || document.getElementById("movie_player");
+    } catch (_) {
+      return document.getElementById("movie_player");
+    }
+  }
+
+  function normalizeTrack(track, source = "web") {
+    if (!track) return null;
+    return {
+      languageCode: String(track.languageCode || track.lang_code || ""),
+      kind: String(track.kind || ""),
+      baseUrl: String(track.baseUrl || track.url || ""),
+      isTranslatable: Boolean(track.isTranslatable),
+      source,
+    };
+  }
+
+  function normalizeTracks(tracks, source = "web") {
+    return Array.from(tracks || [])
+      .map((track) => normalizeTrack(track, source))
+      .filter((track) => track?.baseUrl);
+  }
+
+  function getRuntimeCaptionTracks() {
+    const player = getMoviePlayer();
+    if (!player) return [];
+
+    try {
+      if (typeof player.getAudioTrack === "function") {
+        const audioTrack = player.getAudioTrack();
+        const tracks = normalizeTracks(audioTrack?.captionTracks);
+        if (tracks.length) return tracks;
+      }
+    } catch (error) {
+      console.debug("[yt-dualsub] getAudioTrack() unavailable", error);
+    }
+
+    try {
+      if (typeof player.getPlayerResponse === "function") {
+        const response = player.getPlayerResponse();
+        if (response?.videoDetails?.videoId && response.videoDetails.videoId !== getVideoId()) return [];
+        const tracks = normalizeTracks(
+          response?.captions?.playerCaptionsTracklistRenderer?.captionTracks,
+        );
+        if (tracks.length) return tracks;
+      }
+    } catch (error) {
+      console.debug("[yt-dualsub] getPlayerResponse() unavailable", error);
+    }
+
+    return [];
+  }
+
   function extractPlayerResponse() {
-    if (window.ytInitialPlayerResponse) return window.ytInitialPlayerResponse;
+    const videoId = getVideoId();
+    const player = getMoviePlayer();
+
+    try {
+      if (player && typeof player.getPlayerResponse === "function") {
+        const response = player.getPlayerResponse();
+        if (!response?.videoDetails?.videoId || response.videoDetails.videoId === videoId) return response;
+      }
+    } catch (_) {
+      // Fall through.
+    }
+
+    try {
+      const response = PAGE.ytInitialPlayerResponse;
+      if (response && (!response?.videoDetails?.videoId || response.videoDetails.videoId === videoId)) {
+        return response;
+      }
+    } catch (_) {
+      // Fall through.
+    }
+
     for (const script of document.scripts) {
       const text = script.textContent || "";
-      const index = text.indexOf("ytInitialPlayerResponse");
-      if (index < 0) continue;
-      const start = text.indexOf("{", text.indexOf("=", index));
-      const json = start >= 0 ? readBalancedJson(text, start) : "";
-      if (!json) continue;
-      try {
-        return JSON.parse(json);
-      } catch (_) {
-        // Continue searching.
+      let fromIndex = 0;
+      while (fromIndex < text.length) {
+        const index = text.indexOf("ytInitialPlayerResponse", fromIndex);
+        if (index < 0) break;
+        const equalIndex = text.indexOf("=", index);
+        const start = equalIndex >= 0 ? text.indexOf("{", equalIndex) : -1;
+        const json = start >= 0 ? readBalancedJson(text, start) : "";
+        fromIndex = index + 1;
+        if (!json) continue;
+        try {
+          const response = JSON.parse(json);
+          if (!response?.videoDetails?.videoId || response.videoDetails.videoId === videoId) return response;
+        } catch (_) {
+          // Continue searching.
+        }
       }
     }
     return null;
@@ -237,7 +342,21 @@
   }
 
   function getCaptionTracks() {
-    return extractPlayerResponse()?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+    const runtime = getRuntimeCaptionTracks();
+    if (runtime.length) return runtime;
+    return normalizeTracks(
+      extractPlayerResponse()?.captions?.playerCaptionsTracklistRenderer?.captionTracks,
+    );
+  }
+
+  async function waitForCaptionTracks(timeoutMs = CONFIG.playerReadyTimeoutMs) {
+    const startedAt = Date.now();
+    let tracks = getCaptionTracks();
+    while (!tracks.length && Date.now() - startedAt < timeoutMs) {
+      await sleep(200);
+      tracks = getCaptionTracks();
+    }
+    return tracks;
   }
 
   function chooseOriginalTrack(tracks) {
@@ -250,109 +369,207 @@
     return (CONFIG.preferManualCaptions && usable.find((track) => track.kind !== "asr")) || usable[0] || null;
   }
 
-  function withQuery(url, params) {
+  function withQuery(url, params, { overwrite = true } = {}) {
     const next = new URL(url, location.href);
     for (const [key, value] of Object.entries(params)) {
-      if (value === undefined || value === null || value === "") next.searchParams.delete(key);
-      else next.searchParams.set(key, value);
+      if (value === undefined || value === null || value === "") {
+        if (overwrite) next.searchParams.delete(key);
+      } else if (overwrite || !next.searchParams.has(key)) {
+        next.searchParams.set(key, value);
+      }
     }
     return next.toString();
   }
 
-  function requestText(url) {
+  async function requestText(url, { credentials = "include", allowGM = true } = {}) {
+    let firstError = null;
+
+    // Same-origin fetch is preferable now that subtitle PO tokens can be tied to
+    // the live browser session/video. WEB requests include normal YouTube cookies;
+    // Android fallback requests deliberately omit them to stay in that client context.
+    try {
+      const response = await fetch(url, { credentials });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const text = await response.text();
+      if (text.trim()) return text;
+      firstError = new Error("Caption endpoint returned an empty response");
+    } catch (error) {
+      firstError = error;
+    }
+
+    if (!allowGM || typeof GM_xmlhttpRequest !== "function") throw firstError;
+
     return new Promise((resolve, reject) => {
-      if (typeof GM_xmlhttpRequest === "function") {
-        GM_xmlhttpRequest({
-          method: "GET",
-          url,
-          onload: (response) => resolve(response.responseText || ""),
-          onerror: reject,
-          ontimeout: reject,
-        });
-      } else {
-        fetch(url, { credentials: "include" })
-          .then((response) => {
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return response.text();
-          })
-          .then(resolve, reject);
-      }
+      GM_xmlhttpRequest({
+        method: "GET",
+        url,
+        timeout: 6000,
+        onload: (response) => {
+          const text = response.responseText || "";
+          if (response.status >= 200 && response.status < 300 && text.trim()) resolve(text);
+          else reject(firstError || new Error(`GM request failed: HTTP ${response.status}, empty=${!text.trim()}`));
+        },
+        onerror: () => reject(firstError || new Error("GM request failed")),
+        ontimeout: () => reject(firstError || new Error("GM request timed out")),
+      });
     });
   }
 
+  function getYtCfgValue(key) {
+    try {
+      const cfg = PAGE.ytcfg;
+      if (typeof cfg?.get === "function") {
+        const value = cfg.get(key);
+        if (value !== undefined && value !== null) return value;
+      }
+      if (cfg?.data_ && cfg.data_[key] !== undefined) return cfg.data_[key];
+    } catch (_) {
+      // Fall through to script lookup where useful.
+    }
+    return undefined;
+  }
+
   function getPlayerClientParams() {
-    const cfg = window.ytcfg;
-    const clientVersion = typeof cfg?.get === "function"
-      ? cfg.get("INNERTUBE_CLIENT_VERSION")
-      : cfg?.data_?.INNERTUBE_CLIENT_VERSION;
-    const chrome = navigator.userAgent.match(/Chrome\/([0-9.]+)/)?.[1] || "";
+    const clientVersion = getYtCfgValue("INNERTUBE_CLIENT_VERSION") || "";
+    const ua = navigator.userAgent;
+    const chrome = ua.match(/Chrome\/([0-9.]+)/)?.[1];
+    const firefox = ua.match(/Firefox\/([0-9.]+)/)?.[1];
+    const safari = !chrome && ua.match(/Version\/([0-9.]+).*Safari/)?.[1];
+    const browserName = chrome ? "Chrome" : firefox ? "Firefox" : safari ? "Safari" : "";
+    const browserVersion = chrome || firefox || safari || "";
+    const isMac = /Macintosh/.test(ua);
+    const isWindows = /Windows/.test(ua);
+
     return {
       xorb: "2",
       xobt: "3",
       xovt: "3",
-      cbrand: "apple",
-      cbr: "Chrome",
-      cbrver: chrome,
+      cbr: browserName,
+      cbrver: browserVersion,
       c: "WEB",
-      cver: clientVersion || "",
+      cver: clientVersion,
       cplayer: "UNIPLAYER",
-      cos: "Macintosh",
-      cosver: "10_15_7",
+      cos: isMac ? "Macintosh" : isWindows ? "Windows" : "",
+      cosver: isMac ? (ua.match(/Mac OS X ([0-9_]+)/)?.[1] || "").replaceAll("_", ".") : "",
       cplatform: "DESKTOP",
     };
   }
 
-  function getTimedtextProofParams() {
+  const TIMEDTEXT_CONTEXT_KEYS = [
+    "pot", "potc", "xorb", "xobt", "xovt", "xowf", "cbrand", "cbr", "cbrver",
+    "c", "cver", "cplayer", "cos", "cosver", "cplatform",
+  ];
+
+  function pickTimedtextContext(urlString) {
+    try {
+      const url = new URL(urlString, location.href);
+      const result = {};
+      for (const key of TIMEDTEXT_CONTEXT_KEYS) {
+        const value = url.searchParams.get(key);
+        if (value) result[key] = value;
+      }
+      return result;
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function getTimedtextContextParams() {
     const videoId = getVideoId();
+
+    // The live movie_player often exposes a caption URL that already has the
+    // fresh per-video PO token. Prefer that over the initial page response.
+    for (const track of getRuntimeCaptionTracks()) {
+      const params = pickTimedtextContext(track.baseUrl);
+      if (params.pot) return params;
+    }
+
     const entries = performance
       .getEntriesByType("resource")
       .map((entry) => entry.name)
-      .filter((url) => url.includes("/api/timedtext") && url.includes(`v=${videoId}`))
+      .filter((url) => {
+        if (!url.includes("/api/timedtext")) return false;
+        try {
+          return new URL(url).searchParams.get("v") === videoId;
+        } catch (_) {
+          return false;
+        }
+      })
       .reverse();
+
+    let best = {};
     for (const entryUrl of entries) {
-      try {
-        const url = new URL(entryUrl);
-        const pot = url.searchParams.get("pot");
-        if (pot) return { pot, potc: url.searchParams.get("potc") || "1" };
-      } catch (_) {
-        // Ignore malformed resource entries.
-      }
+      const params = pickTimedtextContext(entryUrl);
+      if (!Object.keys(best).length) best = params;
+      if (params.pot) return params;
     }
-    return {};
+    return best;
+  }
+
+  async function waitForProofToken(timeoutMs = CONFIG.proofTokenTimeoutMs) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const params = getTimedtextContextParams();
+      if (params.pot) return params;
+      await sleep(100);
+    }
+    return getTimedtextContextParams();
   }
 
   async function primeProofParamsIfNeeded() {
-    if (getTimedtextProofParams().pot) return;
+    if (getTimedtextContextParams().pot) return;
+
     const button = document.querySelector(".ytp-subtitles-button");
     if (!button) return;
+
     const wasPressed = button.getAttribute("aria-pressed") === "true";
-    button.click();
-    await new Promise((resolve) => {
-      const startedAt = Date.now();
-      const timer = window.setInterval(() => {
-        if (getTimedtextProofParams().pot || Date.now() - startedAt > 2200) {
-          window.clearInterval(timer);
-          resolve();
-        }
-      }, 100);
-    });
-    if (!wasPressed) button.click();
+
+    // If captions were already ON, toggling only once turns them OFF and does
+    // not generate a fresh timedtext request. Force OFF -> ON in that case.
+    if (wasPressed) {
+      button.click();
+      await sleep(120);
+      button.click();
+    } else {
+      button.click();
+    }
+
+    await waitForProofToken();
+
+    // Restore the user's original native-caption state.
+    if (!wasPressed && button.getAttribute("aria-pressed") === "true") {
+      button.click();
+    }
   }
 
-  function buildCaptionUrl(baseUrl, translatedLang) {
-    return withQuery(baseUrl, {
+  function buildCaptionUrl(track, translatedLang) {
+    let url = withQuery(track.baseUrl, {
       fmt: "json3",
       tlang: translatedLang,
-      ...getPlayerClientParams(),
-      ...getTimedtextProofParams(),
     });
+
+    // Android is deliberately a separate fallback path. Do not contaminate an
+    // Android signed caption URL with WEB client metadata or a WEB PO token.
+    if (track.source === "android") return url;
+
+    // Preserve values already supplied by YouTube's live caption URL. Only add
+    // missing WEB client metadata, then inject the freshest observed PO token.
+    url = withQuery(url, getPlayerClientParams(), { overwrite: false });
+    url = withQuery(url, getTimedtextContextParams(), { overwrite: false });
+    return url;
   }
 
   async function loadJson3Captions(track, translatedLang) {
-    const text = await requestText(buildCaptionUrl(track.baseUrl, translatedLang));
+    const url = buildCaptionUrl(track, translatedLang);
+    const text = await requestText(url, {
+      credentials: track.source === "android" ? "omit" : "include",
+      allowGM: track.source !== "android",
+    });
     if (!text.trim()) throw new Error("Caption endpoint returned an empty response");
     const payload = JSON.parse(text);
-    return parseJson3(payload);
+    const rows = parseJson3(payload);
+    if (!rows.length) throw new Error("Caption endpoint returned no cue events");
+    return rows;
   }
 
   function parseJson3(payload) {
@@ -373,10 +590,65 @@
     return rows.sort((a, b) => a.startMs - b.startMs);
   }
 
+  function getInnertubeApiKey() {
+    const configured = getYtCfgValue("INNERTUBE_API_KEY");
+    if (configured) return String(configured);
+
+    for (const script of document.scripts) {
+      const match = (script.textContent || "").match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
+      if (match) return match[1];
+    }
+    return "";
+  }
+
+  async function fetchAndroidCaptionTracks(videoId) {
+    const apiKey = getInnertubeApiKey();
+    if (!apiKey) return [];
+
+    try {
+      const response = await fetch(
+        `https://www.youtube.com/youtubei/v1/player?key=${encodeURIComponent(apiKey)}&prettyPrint=false`,
+        {
+          method: "POST",
+          credentials: "omit",
+          headers: {
+            "Content-Type": "application/json",
+            "X-YouTube-Client-Name": "3",
+            "X-YouTube-Client-Version": ANDROID_CLIENT.clientVersion,
+          },
+          body: JSON.stringify({
+            context: { client: ANDROID_CLIENT },
+            videoId,
+            contentCheckOk: true,
+            racyCheckOk: true,
+          }),
+        },
+      );
+      if (!response.ok) throw new Error(`Android player API HTTP ${response.status}`);
+      const payload = await response.json();
+      return normalizeTracks(
+        payload?.captions?.playerCaptionsTracklistRenderer?.captionTracks,
+        "android",
+      );
+    } catch (error) {
+      console.warn("[yt-dualsub] Android Innertube fallback failed", error);
+      return [];
+    }
+  }
+
+  async function loadPair(track) {
+    return Promise.all([
+      loadJson3Captions(track, ""),
+      loadJson3Captions(track, CONFIG.translatedLang),
+    ]);
+  }
+
   async function loadForCurrentVideo() {
     if (!STATE.enabled) return;
     const videoId = getVideoId();
     if (!videoId || (videoId === STATE.videoId && STATE.original.length)) return;
+
+    const serial = ++STATE.loadSerial;
     STATE.videoId = videoId;
     STATE.original = [];
     STATE.translated = [];
@@ -384,35 +656,70 @@
     STATE.lastTranslatedText = "";
     setStatus("字幕を読み込み中...");
 
-    const track = chooseOriginalTrack(getCaptionTracks());
+    let tracks = await waitForCaptionTracks();
+    if (serial !== STATE.loadSerial || getVideoId() !== videoId || !STATE.enabled) return;
+
+    let track = chooseOriginalTrack(tracks);
     if (!track?.baseUrl) {
-      setStatus("この動画では取得可能な字幕トラックが見つかりません");
-      return;
+      // The WEB player occasionally exposes no captions yet even though the
+      // Android player response does. Try that path before giving up.
+      tracks = await fetchAndroidCaptionTracks(videoId);
+      track = chooseOriginalTrack(tracks);
+      if (!track?.baseUrl) {
+        setStatus("この動画では取得可能な字幕トラックが見つかりません");
+        return;
+      }
     }
 
+    const failures = [];
+
     try {
-      let original;
-      let translated;
-      try {
-        [original, translated] = await Promise.all([
-          loadJson3Captions(track, ""),
-          loadJson3Captions(track, CONFIG.translatedLang),
-        ]);
-      } catch (firstError) {
-        await primeProofParamsIfNeeded();
-        [original, translated] = await Promise.all([
-          loadJson3Captions(track, ""),
-          loadJson3Captions(track, CONFIG.translatedLang),
-        ]);
-        console.info("[yt-dualsub] caption load succeeded after proof-token priming", firstError);
-      }
+      const [original, translated] = await loadPair(track);
+      if (serial !== STATE.loadSerial || getVideoId() !== videoId || !STATE.enabled) return;
       STATE.original = original;
       STATE.translated = translated;
       setStatus("");
+      return;
     } catch (error) {
-      console.error("[yt-dualsub] failed to load captions", error);
-      setStatus("字幕の取得に失敗しました。動画を再読み込みしてください");
+      failures.push(error);
     }
+
+    // Refresh the live WEB caption URL and obtain the per-video PO token.
+    try {
+      await primeProofParamsIfNeeded();
+      if (serial !== STATE.loadSerial || getVideoId() !== videoId || !STATE.enabled) return;
+      track = chooseOriginalTrack(getCaptionTracks()) || track;
+      const [original, translated] = await loadPair(track);
+      if (serial !== STATE.loadSerial || getVideoId() !== videoId || !STATE.enabled) return;
+      STATE.original = original;
+      STATE.translated = translated;
+      setStatus("");
+      console.info("[yt-dualsub] caption load succeeded after live PO-token refresh", failures[0]);
+      return;
+    } catch (error) {
+      failures.push(error);
+    }
+
+    // WEB subtitles are currently subject to rolling PO-token enforcement.
+    // Android caption URLs are a useful fallback because Subs PO-token policy is
+    // not currently enforced for this client in yt-dlp's client matrix.
+    try {
+      const androidTracks = await fetchAndroidCaptionTracks(videoId);
+      const androidTrack = chooseOriginalTrack(androidTracks);
+      if (!androidTrack?.baseUrl) throw new Error("Android player response had no usable caption track");
+      const [original, translated] = await loadPair(androidTrack);
+      if (serial !== STATE.loadSerial || getVideoId() !== videoId || !STATE.enabled) return;
+      STATE.original = original;
+      STATE.translated = translated;
+      setStatus("");
+      console.info("[yt-dualsub] caption load succeeded via Android Innertube fallback", failures);
+      return;
+    } catch (error) {
+      failures.push(error);
+    }
+
+    console.error("[yt-dualsub] failed to load captions", failures);
+    setStatus("字幕の取得に失敗しました。F12 Console の [yt-dualsub] を確認してください");
   }
 
   function findActive(rows, currentMs) {
@@ -441,6 +748,7 @@
       root.style.display = "none";
       return;
     }
+
     const video = document.querySelector("video");
     const currentMs = video ? video.currentTime * 1000 : 0;
     const originalText = findActive(STATE.original, currentMs);
@@ -467,16 +775,18 @@
 
   function scheduleReload() {
     clearTimeout(STATE.reloadTimer);
+    STATE.loadSerial += 1;
     STATE.reloadTimer = window.setTimeout(() => {
       STATE.videoId = "";
       if (STATE.enabled) loadForCurrentVideo();
-    }, 450);
+    }, 500);
   }
 
   function start() {
     ensureToggleButton();
     ensureRoot();
     if (STATE.enabled) loadForCurrentVideo();
+
     window.setInterval(() => {
       const videoId = getVideoId();
       if (videoId !== STATE.videoId) {
@@ -485,7 +795,9 @@
       }
       render();
     }, CONFIG.pollMs);
+
     window.addEventListener("yt-navigate-finish", scheduleReload);
+    document.addEventListener("yt-navigate-finish", scheduleReload);
     window.addEventListener("popstate", scheduleReload);
   }
 
